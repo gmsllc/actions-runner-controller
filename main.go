@@ -17,15 +17,15 @@ limitations under the License.
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 
-	"github.com/google/go-github/v29/github"
 	actionsv1alpha1 "github.com/summerwind/actions-runner-controller/api/v1alpha1"
 	"github.com/summerwind/actions-runner-controller/controllers"
-	"golang.org/x/oauth2"
+	"github.com/summerwind/actions-runner-controller/github"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
@@ -35,8 +35,8 @@ import (
 )
 
 const (
-	defaultRunnerImage = "summerwind/actions-runner:v2.165.2"
-	defaultDockerImage = "docker:19.03.6-dind"
+	defaultRunnerImage = "summerwind/actions-runner:latest"
+	defaultDockerImage = "docker:dind"
 )
 
 var (
@@ -53,12 +53,20 @@ func init() {
 
 func main() {
 	var (
+		err      error
+		ghClient *github.Client
+
 		metricsAddr          string
 		enableLeaderElection bool
+		syncPeriod           time.Duration
 
 		runnerImage string
 		dockerImage string
-		ghToken     string
+
+		ghToken             string
+		ghAppID             int64
+		ghAppInstallationID int64
+		ghAppPrivateKey     string
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
@@ -66,21 +74,58 @@ func main() {
 		"Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager.")
 	flag.StringVar(&runnerImage, "runner-image", defaultRunnerImage, "The image name of self-hosted runner container.")
 	flag.StringVar(&dockerImage, "docker-image", defaultDockerImage, "The image name of docker sidecar container.")
-	flag.StringVar(&ghToken, "github-token", "", "The access token of GitHub.")
+	flag.StringVar(&ghToken, "github-token", "", "The personal access token of GitHub.")
+	flag.Int64Var(&ghAppID, "github-app-id", 0, "The application ID of GitHub App.")
+	flag.Int64Var(&ghAppInstallationID, "github-app-installation-id", 0, "The installation ID of GitHub App.")
+	flag.StringVar(&ghAppPrivateKey, "github-app-private-key", "", "The path of a private key file to authenticate as a GitHub App")
+	flag.DurationVar(&syncPeriod, "sync-period", 10*time.Minute, "Determines the minimum frequency at which K8s resources managed by this controller are reconciled. When you use autoscaling, set to a lower value like 10 minute, because this corresponds to the minimum time to react on demand change")
 	flag.Parse()
 
 	if ghToken == "" {
 		ghToken = os.Getenv("GITHUB_TOKEN")
 	}
-	if ghToken == "" {
-		fmt.Fprintln(os.Stderr, "Error: GitHub access token must be specified.")
-		os.Exit(1)
+	if ghAppID == 0 {
+		appID, err := strconv.ParseInt(os.Getenv("GITHUB_APP_ID"), 10, 64)
+		if err == nil {
+			ghAppID = appID
+		}
+	}
+	if ghAppInstallationID == 0 {
+		appInstallationID, err := strconv.ParseInt(os.Getenv("GITHUB_APP_INSTALLATION_ID"), 10, 64)
+		if err == nil {
+			ghAppInstallationID = appInstallationID
+		}
+	}
+	if ghAppPrivateKey == "" {
+		ghAppPrivateKey = os.Getenv("GITHUB_APP_PRIVATE_KEY")
 	}
 
-	tc := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: ghToken},
-	))
-	ghClient := github.NewClient(tc)
+	if ghAppID != 0 {
+		if ghAppInstallationID == 0 {
+			fmt.Fprintln(os.Stderr, "Error: The installation ID must be specified.")
+			os.Exit(1)
+		}
+
+		if ghAppPrivateKey == "" {
+			fmt.Fprintln(os.Stderr, "Error: The path of a private key file must be specified.")
+			os.Exit(1)
+		}
+
+		ghClient, err = github.NewClient(ghAppID, ghAppInstallationID, ghAppPrivateKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Failed to create GitHub client: %v\n", err)
+			os.Exit(1)
+		}
+	} else if ghToken != "" {
+		ghClient, err = github.NewClientWithAccessToken(ghToken)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Failed to create GitHub client: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "Error: GitHub App credentials or personal access token must be specified.")
+		os.Exit(1)
+	}
 
 	ctrl.SetLogger(zap.New(func(o *zap.Options) {
 		o.Development = true
@@ -91,6 +136,7 @@ func main() {
 		MetricsBindAddress: metricsAddr,
 		LeaderElection:     enableLeaderElection,
 		Port:               9443,
+		SyncPeriod:         &syncPeriod,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -130,6 +176,31 @@ func main() {
 
 	if err = runnerDeploymentReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RunnerDeployment")
+		os.Exit(1)
+	}
+
+	horizontalRunnerAutoscaler := &controllers.HorizontalRunnerAutoscalerReconciler{
+		Client:       mgr.GetClient(),
+		Log:          ctrl.Log.WithName("controllers").WithName("HorizontalRunnerAutoscaler"),
+		Scheme:       mgr.GetScheme(),
+		GitHubClient: ghClient,
+	}
+
+	if err = horizontalRunnerAutoscaler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "HorizontalRunnerAutoscaler")
+		os.Exit(1)
+	}
+
+	if err = (&actionsv1alpha1.Runner{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "Runner")
+		os.Exit(1)
+	}
+	if err = (&actionsv1alpha1.RunnerDeployment{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "RunnerDeployment")
+		os.Exit(1)
+	}
+	if err = (&actionsv1alpha1.RunnerReplicaSet{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "RunnerReplicaSet")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

@@ -21,6 +21,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"time"
+
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/go-logr/logr"
@@ -54,10 +57,11 @@ type RunnerDeploymentReconciler struct {
 // +kubebuilder:rbac:groups=actions.summerwind.dev,resources=runnerdeployments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=actions.summerwind.dev,resources=runnerreplicasets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=actions.summerwind.dev,resources=runnerreplicasets/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 func (r *RunnerDeploymentReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	ctx := context.Background()
-	log := r.Log.WithValues("runnerreplicaset", req.NamespacedName)
+	log := r.Log.WithValues("runnerdeployment", req.NamespacedName)
 
 	var rd v1alpha1.RunnerDeployment
 	if err := r.Get(ctx, req.NamespacedName, &rd); err != nil {
@@ -93,13 +97,15 @@ func (r *RunnerDeploymentReconciler) Reconcile(req ctrl.Request) (ctrl.Result, e
 
 	desiredRS, err := r.newRunnerReplicaSet(rd)
 	if err != nil {
+		r.Recorder.Event(&rd, corev1.EventTypeNormal, "RunnerAutoscalingFailure", err.Error())
+
 		log.Error(err, "Could not create runnerreplicaset")
 
 		return ctrl.Result{}, err
 	}
 
 	if newestSet == nil {
-		if err := r.Client.Create(ctx, &desiredRS); err != nil {
+		if err := r.Client.Create(ctx, desiredRS); err != nil {
 			log.Error(err, "Failed to create runnerreplicaset resource")
 
 			return ctrl.Result{}, err
@@ -115,7 +121,7 @@ func (r *RunnerDeploymentReconciler) Reconcile(req ctrl.Request) (ctrl.Result, e
 		return ctrl.Result{}, nil
 	}
 
-	desiredTemplateHash, ok := getTemplateHash(&desiredRS)
+	desiredTemplateHash, ok := getTemplateHash(desiredRS)
 	if !ok {
 		log.Info("Failed to get template hash of desired runnerreplicaset resource. It must be in an invalid state. Please manually delete the runnerreplicaset so that it is recreated")
 
@@ -123,18 +129,25 @@ func (r *RunnerDeploymentReconciler) Reconcile(req ctrl.Request) (ctrl.Result, e
 	}
 
 	if newestTemplateHash != desiredTemplateHash {
-		if err := r.Client.Create(ctx, &desiredRS); err != nil {
+		if err := r.Client.Create(ctx, desiredRS); err != nil {
 			log.Error(err, "Failed to create runnerreplicaset resource")
 
 			return ctrl.Result{}, err
 		}
 
-		return ctrl.Result{}, nil
+		// We requeue in order to clean up old runner replica sets later.
+		// Otherwise, they aren't cleaned up until the next re-sync interval.
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
+	const defaultReplicas = 1
+
+	currentDesiredReplicas := getIntOrDefault(newestSet.Spec.Replicas, defaultReplicas)
+	newDesiredReplicas := getIntOrDefault(desiredRS.Spec.Replicas, defaultReplicas)
+
 	// Please add more conditions that we can in-place update the newest runnerreplicaset without disruption
-	if newestSet.Spec.Replicas != desiredRS.Spec.Replicas {
-		newestSet.Spec.Replicas = desiredRS.Spec.Replicas
+	if currentDesiredReplicas != newDesiredReplicas {
+		newestSet.Spec.Replicas = &newDesiredReplicas
 
 		if err := r.Client.Update(ctx, newestSet); err != nil {
 			log.Error(err, "Failed to update runnerreplicaset resource")
@@ -142,23 +155,58 @@ func (r *RunnerDeploymentReconciler) Reconcile(req ctrl.Request) (ctrl.Result, e
 			return ctrl.Result{}, err
 		}
 
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, err
 	}
 
-	for i := range oldSets {
-		rs := oldSets[i]
+	// Do we old runner replica sets that should eventually deleted?
+	if len(oldSets) > 0 {
+		readyReplicas := newestSet.Status.ReadyReplicas
 
-		if err := r.Client.Delete(ctx, &rs); err != nil {
-			log.Error(err, "Failed to delete runner resource")
+		if readyReplicas < currentDesiredReplicas {
+			log.WithValues("runnerreplicaset", types.NamespacedName{
+				Namespace: newestSet.Namespace,
+				Name:      newestSet.Name,
+			}).
+				Info("Waiting until the newest runner replica set to be 100% available")
+
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+
+		for i := range oldSets {
+			rs := oldSets[i]
+
+			if err := r.Client.Delete(ctx, &rs); err != nil {
+				log.Error(err, "Failed to delete runner resource")
+
+				return ctrl.Result{}, err
+			}
+
+			r.Recorder.Event(&rd, corev1.EventTypeNormal, "RunnerReplicaSetDeleted", fmt.Sprintf("Deleted runnerreplicaset '%s'", rs.Name))
+
+			log.Info("Deleted runnerreplicaset", "runnerdeployment", rd.ObjectMeta.Name, "runnerreplicaset", rs.Name)
+		}
+	}
+
+	if rd.Spec.Replicas == nil && desiredRS.Spec.Replicas != nil {
+		updated := rd.DeepCopy()
+		updated.Status.Replicas = desiredRS.Spec.Replicas
+
+		if err := r.Status().Update(ctx, updated); err != nil {
+			log.Error(err, "Failed to update runnerdeployment status")
 
 			return ctrl.Result{}, err
 		}
-
-		r.Recorder.Event(&rd, corev1.EventTypeNormal, "RunnerReplicaSetDeleted", fmt.Sprintf("Deleted runnerreplicaset '%s'", rs.Name))
-		log.Info("Deleted runnerreplicaset", "runnerdeployment", rd.ObjectMeta.Name, "runnerreplicaset", rs.Name)
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func getIntOrDefault(p *int, d int) int {
+	if p == nil {
+		return d
+	}
+
+	return *p
 }
 
 func getTemplateHash(rs *v1alpha1.RunnerReplicaSet) (string, bool) {
@@ -207,7 +255,7 @@ func CloneAndAddLabel(labels map[string]string, labelKey, labelValue string) map
 	return newLabels
 }
 
-func (r *RunnerDeploymentReconciler) newRunnerReplicaSet(rd v1alpha1.RunnerDeployment) (v1alpha1.RunnerReplicaSet, error) {
+func (r *RunnerDeploymentReconciler) newRunnerReplicaSet(rd v1alpha1.RunnerDeployment) (*v1alpha1.RunnerReplicaSet, error) {
 	newRSTemplate := *rd.Spec.Template.DeepCopy()
 	templateHash := ComputeHash(&newRSTemplate)
 	// Add template hash label to selector.
@@ -229,10 +277,10 @@ func (r *RunnerDeploymentReconciler) newRunnerReplicaSet(rd v1alpha1.RunnerDeplo
 	}
 
 	if err := ctrl.SetControllerReference(&rd, &rs, r.Scheme); err != nil {
-		return rs, err
+		return &rs, err
 	}
 
-	return rs, nil
+	return &rs, nil
 }
 
 func (r *RunnerDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {

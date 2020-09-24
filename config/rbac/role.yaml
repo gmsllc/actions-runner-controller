@@ -9,6 +9,26 @@ rules:
 - apiGroups:
   - actions.summerwind.dev
   resources:
+  - horizontalrunnerautoscalers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - actions.summerwind.dev
+  resources:
+  - horizontalrunnerautoscalers/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - actions.summerwind.dev
+  resources:
   - runnerdeployments
   verbs:
   - create
@@ -66,6 +86,13 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 - apiGroups:
   - ""
   resources:

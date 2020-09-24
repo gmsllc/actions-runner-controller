@@ -20,9 +20,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const (
+	AutoscalingMetricTypeTotalNumberOfQueuedAndInProgressWorkflowRuns = "TotalNumberOfQueuedAndInProgressWorkflowRuns"
+)
+
 // RunnerReplicaSetSpec defines the desired state of RunnerDeployment
 type RunnerDeploymentSpec struct {
-	Replicas *int `json:"replicas"`
+	// +optional
+	Replicas *int `json:"replicas,omitempty"`
 
 	Template RunnerTemplate `json:"template"`
 }
@@ -30,6 +35,11 @@ type RunnerDeploymentSpec struct {
 type RunnerDeploymentStatus struct {
 	AvailableReplicas int `json:"availableReplicas"`
 	ReadyReplicas     int `json:"readyReplicas"`
+
+	// Replicas is the total number of desired, non-terminated and latest pods to be set for the primary RunnerSet
+	// This doesn't include outdated pods while upgrading the deployment and replacing the runnerset.
+	// +optional
+	Replicas *int `json:"desiredReplicas,omitempty"`
 }
 
 // +kubebuilder:object:root=true

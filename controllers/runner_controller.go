@@ -20,10 +20,9 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"time"
+	"strings"
 
 	"github.com/go-logr/logr"
-	"github.com/google/go-github/v29/github"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -34,24 +33,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/summerwind/actions-runner-controller/api/v1alpha1"
+	"github.com/summerwind/actions-runner-controller/github"
 )
 
 const (
 	containerName = "runner"
 	finalizerName = "runner.actions.summerwind.dev"
 )
-
-type GitHubRunner struct {
-	ID     int    `json:"id"`
-	Name   string `json:"name"`
-	OS     string `json:"os"`
-	Status string `json:"status"`
-}
-
-type GitHubRegistrationToken struct {
-	Token     string `json:"token"`
-	ExpiresAt string `json:"expires_at"`
-}
 
 // RunnerReconciler reconciles a Runner object
 type RunnerReconciler struct {
@@ -67,6 +55,7 @@ type RunnerReconciler struct {
 // +kubebuilder:rbac:groups=actions.summerwind.dev,resources=runners,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=actions.summerwind.dev,resources=runners/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 func (r *RunnerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	ctx := context.Background()
@@ -75,6 +64,12 @@ func (r *RunnerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	var runner v1alpha1.Runner
 	if err := r.Get(ctx, req.NamespacedName, &runner); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	err := runner.Validate()
+	if err != nil {
+		log.Info("Failed to validate runner spec", "error", err.Error())
+		return ctrl.Result{}, nil
 	}
 
 	if runner.ObjectMeta.DeletionTimestamp.IsZero() {
@@ -95,14 +90,18 @@ func (r *RunnerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		finalizers, removed := removeFinalizer(runner.ObjectMeta.Finalizers)
 
 		if removed {
-			ok, err := r.unregisterRunner(ctx, runner.Spec.Repository, runner.Name)
-			if err != nil {
-				log.Error(err, "Failed to unregister runner")
-				return ctrl.Result{}, err
-			}
+			if len(runner.Status.Registration.Token) > 0 {
+				ok, err := r.unregisterRunner(ctx, runner.Spec.Organization, runner.Spec.Repository, runner.Name)
+				if err != nil {
+					log.Error(err, "Failed to unregister runner")
+					return ctrl.Result{}, err
+				}
 
-			if !ok {
-				log.V(1).Info("Runner no longer exists on GitHub")
+				if !ok {
+					log.V(1).Info("Runner no longer exists on GitHub")
+				}
+			} else {
+				log.V(1).Info("Runner was never registered on GitHub")
 			}
 
 			newRunner := runner.DeepCopy()
@@ -113,14 +112,14 @@ func (r *RunnerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 				return ctrl.Result{}, err
 			}
 
-			log.Info("Removed runner from GitHub", "repository", runner.Spec.Repository)
+			log.Info("Removed runner from GitHub", "repository", runner.Spec.Repository, "organization", runner.Spec.Organization)
 		}
 
 		return ctrl.Result{}, nil
 	}
 
 	if !runner.IsRegisterable() {
-		reg, err := r.newRegistration(ctx, runner.Spec.Repository)
+		rt, err := r.GitHubClient.GetRegistrationToken(ctx, runner.Spec.Organization, runner.Spec.Repository, runner.Name)
 		if err != nil {
 			r.Recorder.Event(&runner, corev1.EventTypeWarning, "FailedUpdateRegistrationToken", "Updating registration token failed")
 			log.Error(err, "Failed to get new registration token")
@@ -128,7 +127,13 @@ func (r *RunnerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		}
 
 		updated := runner.DeepCopy()
-		updated.Status.Registration = reg
+		updated.Status.Registration = v1alpha1.RunnerStatusRegistration{
+			Organization: runner.Spec.Organization,
+			Repository:   runner.Spec.Repository,
+			Labels:       runner.Spec.Labels,
+			Token:        rt.GetToken(),
+			ExpiresAt:    metav1.NewTime(rt.GetExpiresAt().Time),
+		}
 
 		if err := r.Status().Update(ctx, updated); err != nil {
 			log.Error(err, "Failed to update runner status")
@@ -220,107 +225,29 @@ func (r *RunnerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	return ctrl.Result{}, nil
 }
 
-func (r *RunnerReconciler) newRegistration(ctx context.Context, repo string) (v1alpha1.RunnerStatusRegistration, error) {
-	var reg v1alpha1.RunnerStatusRegistration
-
-	rt, err := r.getRegistrationToken(ctx, repo)
-	if err != nil {
-		return reg, err
-	}
-
-	expiresAt, err := time.Parse(time.RFC3339, rt.ExpiresAt)
-	if err != nil {
-		return reg, err
-	}
-
-	reg.Repository = repo
-	reg.Token = rt.Token
-	reg.ExpiresAt = metav1.NewTime(expiresAt)
-
-	return reg, err
-}
-
-func (r *RunnerReconciler) getRegistrationToken(ctx context.Context, repo string) (GitHubRegistrationToken, error) {
-	var regToken GitHubRegistrationToken
-
-	req, err := r.GitHubClient.NewRequest("POST", fmt.Sprintf("/repos/%s/actions/runners/registration-token", repo), nil)
-	if err != nil {
-		return regToken, err
-	}
-
-	res, err := r.GitHubClient.Do(ctx, req, &regToken)
-	if err != nil {
-		return regToken, err
-	}
-
-	if res.StatusCode != 201 {
-		return regToken, fmt.Errorf("unexpected status: %d", res.StatusCode)
-	}
-
-	return regToken, nil
-}
-
-func (r *RunnerReconciler) unregisterRunner(ctx context.Context, repo, name string) (bool, error) {
-	runners, err := r.listRunners(ctx, repo)
+func (r *RunnerReconciler) unregisterRunner(ctx context.Context, org, repo, name string) (bool, error) {
+	runners, err := r.GitHubClient.ListRunners(ctx, org, repo)
 	if err != nil {
 		return false, err
 	}
 
-	id := 0
+	id := int64(0)
 	for _, runner := range runners {
-		if runner.Name == name {
-			id = runner.ID
+		if runner.GetName() == name {
+			id = runner.GetID()
 			break
 		}
 	}
 
-	if id == 0 {
+	if id == int64(0) {
 		return false, nil
 	}
 
-	if err := r.removeRunner(ctx, repo, id); err != nil {
+	if err := r.GitHubClient.RemoveRunner(ctx, org, repo, id); err != nil {
 		return false, err
 	}
 
 	return true, nil
-}
-
-func (r *RunnerReconciler) listRunners(ctx context.Context, repo string) ([]GitHubRunner, error) {
-	runners := []GitHubRunner{}
-
-	req, err := r.GitHubClient.NewRequest("GET", fmt.Sprintf("/repos/%s/actions/runners", repo), nil)
-	if err != nil {
-		return runners, err
-	}
-
-	res, err := r.GitHubClient.Do(ctx, req, &runners)
-	if err != nil {
-		return runners, err
-	}
-
-	if res.StatusCode != 200 {
-		return runners, fmt.Errorf("unexpected status: %d", res.StatusCode)
-	}
-
-	return runners, nil
-}
-
-func (r *RunnerReconciler) removeRunner(ctx context.Context, repo string, id int) error {
-	req, err := r.GitHubClient.NewRequest("DELETE", fmt.Sprintf("/repos/%s/actions/runners/%d", repo, id), nil)
-	if err != nil {
-		return err
-	}
-
-	res, err := r.GitHubClient.Do(ctx, req, nil)
-	if err != nil {
-		return err
-	}
-
-	if res.StatusCode != 204 {
-		return fmt.Errorf("unexpected status: %d", res.StatusCode)
-	}
-
-	return nil
 }
 
 func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
@@ -334,26 +261,41 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 		runnerImage = r.RunnerImage
 	}
 
+	runnerImagePullPolicy := runner.Spec.ImagePullPolicy
+	if runnerImagePullPolicy == "" {
+		runnerImagePullPolicy = corev1.PullAlways
+	}
+
 	env := []corev1.EnvVar{
 		{
 			Name:  "RUNNER_NAME",
 			Value: runner.Name,
 		},
 		{
+			Name:  "RUNNER_ORG",
+			Value: runner.Spec.Organization,
+		},
+		{
 			Name:  "RUNNER_REPO",
 			Value: runner.Spec.Repository,
+		},
+		{
+			Name:  "RUNNER_LABELS",
+			Value: strings.Join(runner.Spec.Labels, ","),
 		},
 		{
 			Name:  "RUNNER_TOKEN",
 			Value: runner.Status.Registration.Token,
 		},
 	}
-	env = append(env, runner.Spec.Env...)
 
+	env = append(env, runner.Spec.Env...)
 	pod := corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      runner.Name,
-			Namespace: runner.Namespace,
+			Name:        runner.Name,
+			Namespace:   runner.Namespace,
+			Labels:      runner.Labels,
+			Annotations: runner.Annotations,
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: "OnFailure",
@@ -361,9 +303,14 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 				{
 					Name:            containerName,
 					Image:           runnerImage,
-					ImagePullPolicy: "Always",
+					ImagePullPolicy: runnerImagePullPolicy,
 					Env:             env,
+					EnvFrom:         runner.Spec.EnvFrom,
 					VolumeMounts: []corev1.VolumeMount{
+						{
+							Name:      "work",
+							MountPath: "/runner/_work",
+						},
 						{
 							Name:      "docker",
 							MountPath: "/var/run",
@@ -372,11 +319,16 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 					SecurityContext: &corev1.SecurityContext{
 						RunAsGroup: &group,
 					},
+					Resources: runner.Spec.Resources,
 				},
 				{
 					Name:  "docker",
 					Image: r.DockerImage,
 					VolumeMounts: []corev1.VolumeMount{
+						{
+							Name:      "work",
+							MountPath: "/runner/_work",
+						},
 						{
 							Name:      "docker",
 							MountPath: "/var/run",
@@ -388,7 +340,13 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 				},
 			},
 			Volumes: []corev1.Volume{
-				corev1.Volume{
+				{
+					Name: "work",
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{},
+					},
+				},
+				{
 					Name: "docker",
 					VolumeSource: corev1.VolumeSource{
 						EmptyDir: &corev1.EmptyDirVolumeSource{},
@@ -396,6 +354,59 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 				},
 			},
 		},
+	}
+
+	if len(runner.Spec.Containers) != 0 {
+		pod.Spec.Containers = runner.Spec.Containers
+	}
+
+	if len(runner.Spec.VolumeMounts) != 0 {
+		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, runner.Spec.VolumeMounts...)
+	}
+
+	if len(runner.Spec.Volumes) != 0 {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, runner.Spec.Volumes...)
+	}
+	if len(runner.Spec.InitContainers) != 0 {
+		pod.Spec.InitContainers = append(pod.Spec.InitContainers, runner.Spec.InitContainers...)
+	}
+
+	if runner.Spec.NodeSelector != nil {
+		pod.Spec.NodeSelector = runner.Spec.NodeSelector
+	}
+	if runner.Spec.ServiceAccountName != "" {
+		pod.Spec.ServiceAccountName = runner.Spec.ServiceAccountName
+	}
+	if runner.Spec.AutomountServiceAccountToken != nil {
+		pod.Spec.AutomountServiceAccountToken = runner.Spec.AutomountServiceAccountToken
+	}
+
+	if len(runner.Spec.SidecarContainers) != 0 {
+		pod.Spec.Containers = append(pod.Spec.Containers, runner.Spec.SidecarContainers...)
+	}
+
+	if runner.Spec.SecurityContext != nil {
+		pod.Spec.SecurityContext = runner.Spec.SecurityContext
+	}
+
+	if len(runner.Spec.ImagePullSecrets) != 0 {
+		pod.Spec.ImagePullSecrets = runner.Spec.ImagePullSecrets
+	}
+
+	if runner.Spec.Affinity != nil {
+		pod.Spec.Affinity = runner.Spec.Affinity
+	}
+
+	if len(runner.Spec.Tolerations) != 0 {
+		pod.Spec.Tolerations = runner.Spec.Tolerations
+	}
+
+	if len(runner.Spec.EphemeralContainers) != 0 {
+		pod.Spec.EphemeralContainers = runner.Spec.EphemeralContainers
+	}
+
+	if runner.Spec.TerminationGracePeriodSeconds != nil {
+		pod.Spec.TerminationGracePeriodSeconds = runner.Spec.TerminationGracePeriodSeconds
 	}
 
 	if err := ctrl.SetControllerReference(&runner, &pod, r.Scheme); err != nil {
